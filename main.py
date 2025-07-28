@@ -68,14 +68,46 @@ async def get_available_classes():
         raise HTTPException(status_code=500, detail="Detector not initialized")
     
     try:
+        # Try to get classes with error handling
+        classes = detector.get_available_classes()
+        categories = detector.get_similar_object_mappings()
+        
         return {
-            "classes": detector.get_available_classes(),
-            "categories": detector.get_similar_object_mappings(),
-            "total_classes": len(detector.get_available_classes())
+            "classes": classes,
+            "categories": categories,
+            "total_classes": len(classes)
         }
     except Exception as e:
         logger.error(f"Error getting available classes: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to get available classes: {str(e)}")
+        
+        # Fallback to hardcoded YOLO classes if model fails
+        fallback_classes = [
+            "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat",
+            "traffic light", "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat",
+            "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe", "backpack",
+            "umbrella", "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard", "sports ball",
+            "kite", "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket",
+            "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple",
+            "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake",
+            "chair", "couch", "potted plant", "bed", "dining table", "toilet", "tv", "laptop",
+            "mouse", "remote", "keyboard", "cell phone", "microwave", "oven", "toaster", "sink",
+            "refrigerator", "book", "clock", "vase", "scissors", "teddy bear", "hair drier", "toothbrush"
+        ]
+        
+        fallback_categories = {
+            "vehicle": ["car", "truck", "bus", "motorcycle", "bicycle"],
+            "person": ["person"],
+            "animal": ["cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe"],
+            "food": ["banana", "apple", "sandwich", "orange", "pizza", "donut", "cake"]
+        }
+        
+        return {
+            "classes": fallback_classes,
+            "categories": fallback_categories,
+            "total_classes": len(fallback_classes),
+            "fallback_used": True,
+            "error": str(e)
+        }
 
 @app.post("/detect")
 async def detect_objects(

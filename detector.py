@@ -111,7 +111,20 @@ class YOLODetector:
     
     def get_available_classes(self) -> List[str]:
         """Get list of all object classes YOLO can detect"""
-        return list(self.model.names.values())
+        try:
+            if hasattr(self.model, 'names') and self.model.names:
+                return list(self.model.names.values())
+            else:
+                # Fallback if model.names is not accessible
+                return [
+                    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat",
+                    "traffic light", "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat",
+                    "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe"
+                    # ... add more as needed
+                ]
+        except Exception as e:
+            print(f"Error accessing model names: {e}")
+            return ["person", "car", "dog", "cat"]  # Minimal fallback
     
     def get_similar_object_mappings(self) -> Dict[str, List[str]]:
         """Get the similar object mappings dictionary"""
