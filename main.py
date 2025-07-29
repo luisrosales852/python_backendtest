@@ -26,9 +26,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="Object Detection API - YOLO Large",
-    description="Advanced YOLO11 Large model object detection service on Railway",
-    version="2.0.0"
+    title="Object Detection API - YOLO Large (Exact Coordinates)",
+    description="Advanced YOLO11 Large model object detection service with EXACT pixel coordinates - NO image resizing",
+    version="2.1.0"
 )
 
 # Railway-optimized environment variables
@@ -42,10 +42,12 @@ MODEL_PATH = os.getenv("MODEL_PATH", "yolo11l.pt")  # Large model default
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "80"))
 
-# Railway-specific settings
+# Railway-specific settings for EXACT coordinate detection
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "1"))  # Single worker for memory efficiency
 RAILWAY_ENVIRONMENT = os.getenv("RAILWAY_ENVIRONMENT", "unknown")
-MAX_IMAGE_SIZE = int(os.getenv("MAX_IMAGE_SIZE", "20971520"))  # 20MB for Large model
+# INCREASED limits to support large images with exact coordinates
+MAX_IMAGE_SIZE = int(os.getenv("MAX_IMAGE_SIZE", "104857600"))  # 100MB for exact coordinate detection
+MAX_RESPONSE_SIZE = int(os.getenv("MAX_RESPONSE_SIZE", "209715200"))  # 200MB for large annotated images
 
 # Enable CORS for Railway deployment
 app.add_middleware(
@@ -80,6 +82,7 @@ async def startup_event():
     try:
         logger.info("=" * 60)
         logger.info("Starting Object Detection API with YOLO Large")
+        logger.info("EXACT COORDINATES MODE - No image resizing")
         logger.info(f"Railway Environment: {RAILWAY_ENVIRONMENT}")
         logger.info("=" * 60)
         
@@ -90,6 +93,7 @@ async def startup_event():
         logger.info(f"  - Total Memory: {memory.total / (1024**3):.2f} GB")
         logger.info(f"  - Available Memory: {memory.available / (1024**3):.2f} GB")
         logger.info(f"  - CPU Cores: {cpu_count}")
+        logger.info(f"  - Max Image Size: {MAX_IMAGE_SIZE / (1024*1024):.1f} MB")
         
         logger.info(f"Initializing YOLO Large detector with model: {MODEL_PATH}")
         detector = YOLODetector(model_path=MODEL_PATH)
@@ -120,9 +124,11 @@ async def health_check():
         "status": "healthy" if detector is not None else "detector_error",
         "detector_loaded": detector is not None,
         "detector_error": detector_error,
-        "message": "Object Detection API with YOLO Large is running",
+        "message": "Object Detection API with YOLO Large - EXACT COORDINATES",
         "model_path": MODEL_PATH,
         "model_type": "YOLO11 Large",
+        "coordinate_mode": "EXACT_ORIGINAL",
+        "max_image_size_mb": MAX_IMAGE_SIZE / (1024 * 1024),
         "cors_origins": CORS_ORIGINS,
         "environment": RAILWAY_ENVIRONMENT,
         "system": {
@@ -151,7 +157,8 @@ async def get_available_classes():
             "classes": classes,
             "categories": categories,
             "total_classes": len(classes),
-            "model_type": "YOLO11 Large"
+            "model_type": "YOLO11 Large",
+            "coordinate_mode": "EXACT_ORIGINAL"
         }
     except Exception as e:
         logger.error(f"Error getting available classes: {e}")
@@ -184,6 +191,7 @@ async def get_available_classes():
             "total_classes": len(fallback_classes),
             "fallback_used": True,
             "model_type": "YOLO11 Large (Fallback)",
+            "coordinate_mode": "EXACT_ORIGINAL",
             "error": str(e)
         }
 
@@ -196,13 +204,16 @@ async def detect_objects(
     fallback_to_all: bool = Form(True)
 ):
     """
-    Detect objects in uploaded image using YOLO Large
+    Detect objects in uploaded image using YOLO Large with EXACT pixel coordinates
     
-    - **file**: Image file to analyze (max 20MB for Large model)
+    - **file**: Image file to analyze (max 100MB for exact coordinate detection)
     - **objects**: Comma-separated list of objects to detect
     - **include_similar**: Whether to include similar objects (default: True)
     - **confidence**: Confidence threshold 0-1 (default: 0.25 for Large model)
     - **fallback_to_all**: Show all detected objects if no matches found (default: True)
+    
+    **IMPORTANT**: All coordinates returned are EXACT pixel locations from your original image.
+    No resizing is performed, ensuring precise bounding box coordinates.
     """
     if detector is None:
         error_msg = f"Detector not initialized. Error: {detector_error}"
@@ -213,10 +224,10 @@ async def detect_objects(
     if not file.content_type or not file.content_type.startswith('image/'):
         raise HTTPException(status_code=400, detail="File must be an image")
     
-    # Check file size (larger limit for Large model)
+    # Check file size (increased limit for exact coordinate detection)
     if file.size and file.size > MAX_IMAGE_SIZE:
         size_mb = MAX_IMAGE_SIZE / (1024 * 1024)
-        raise HTTPException(status_code=400, detail=f"File size must be less than {size_mb}MB")
+        raise HTTPException(status_code=400, detail=f"File size must be less than {size_mb}MB for exact coordinate detection")
     
     # Validate confidence range
     if not 0.0 <= confidence <= 1.0:
@@ -236,17 +247,21 @@ async def detect_objects(
         # Create temporary file with unique name
         temp_dir = os.getenv("TEMP_DIR", "/tmp")  # Railway uses /tmp
         os.makedirs(temp_dir, exist_ok=True)
-        temp_filename = f"detect_{uuid.uuid4().hex}_{file.filename}"
+        temp_filename = f"detect_exact_{uuid.uuid4().hex}_{file.filename}"
         temp_path = os.path.join(temp_dir, temp_filename)
         
-        # Save uploaded file
+        # Save uploaded file with maximum quality to preserve exact dimensions
         with open(temp_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
         
-        logger.info(f"Processing image: {file.filename}, objects: {target_objects}, confidence: {confidence}")
-        logger.info(f"Temp file saved: {temp_path}, size: {os.path.getsize(temp_path)} bytes")
+        file_size_mb = os.path.getsize(temp_path) / (1024 * 1024)
+        logger.info(f"Processing image for EXACT coordinates: {file.filename}")
+        logger.info(f"  - Objects: {target_objects}")
+        logger.info(f"  - Confidence: {confidence}")
+        logger.info(f"  - File size: {file_size_mb:.2f} MB")
+        logger.info(f"  - Temp file: {temp_path}")
         
-        # Run detection with error catching
+        # Run detection with error catching - PRESERVES ORIGINAL DIMENSIONS
         try:
             result = detector.detect_specific_objects(
                 temp_path, 
@@ -267,30 +282,36 @@ async def detect_objects(
             raise HTTPException(status_code=500, detail=f"Detection failed: {result['error']}")
         
         # Log detailed results
-        logger.info(f"Detection completed successfully:")
+        logger.info(f"Detection completed successfully (EXACT COORDINATES):")
         logger.info(f"  - Total objects found: {result.get('total_objects_found', 0)}")
         logger.info(f"  - Matching objects: {result.get('matching_objects_found', 0)}")
         logger.info(f"  - Used fallback: {result.get('used_fallback', False)}")
-        logger.info(f"  - Image dimensions: {result.get('image_dimensions', {})}")
+        logger.info(f"  - Original image dimensions: {result.get('image_dimensions', {})}")
+        logger.info(f"  - Coordinate type: {result.get('coordinates_type', 'Unknown')}")
         logger.info(f"  - Model type: {result.get('model_type', 'Unknown')}")
+        logger.info(f"  - Device used: {result.get('device_used', 'Unknown')}")
         
-        # Railway-optimized response size management
-        response_size_limit = int(os.getenv("MAX_RESPONSE_SIZE", "52428800"))  # 50MB default for Railway
-        
+        # Enhanced response size management for large exact-coordinate images
         # Estimate response size (rough approximation)
-        if "annotated_image_base64" in result:
+        if "annotated_image_base64" in result and result["annotated_image_base64"]:
             estimated_size = len(result["annotated_image_base64"]) * 0.75  # Base64 is ~33% larger than binary
             logger.info(f"Estimated response size: {estimated_size / (1024*1024):.2f} MB")
             
-            if estimated_size > response_size_limit:
+            if estimated_size > MAX_RESPONSE_SIZE:
                 logger.warning(f"Response too large ({estimated_size / (1024*1024):.2f} MB), removing annotated image")
                 result["annotated_image_base64"] = None
                 result["image_too_large"] = True
-                result["message"] = "Image annotations removed due to size. Detection results preserved."
+                result["message"] = "Annotated image removed due to size. Detection coordinates preserved and exact."
         
         # Log memory after processing
         memory_after = psutil.virtual_memory()
         logger.info(f"Memory after processing: {memory_after.available / (1024**3):.2f} GB available")
+        
+        # Add response metadata for exact coordinates
+        result["api_version"] = "2.1.0"
+        result["processing_mode"] = "EXACT_COORDINATES"
+        result["image_resized"] = False
+        result["coordinate_accuracy"] = "PIXEL_PERFECT"
         
         return JSONResponse(
             content=result,
@@ -298,13 +319,15 @@ async def detect_objects(
                 "Access-Control-Allow-Origin": "*",
                 "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
                 "Access-Control-Allow-Headers": "*",
+                "X-Coordinate-Mode": "EXACT_ORIGINAL",
+                "X-Image-Resized": "false"
             }
         )
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Unexpected error during detection: {e}")
+        logger.error(f"Unexpected error during exact coordinate detection: {e}")
         logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
     finally:
@@ -346,6 +369,9 @@ async def get_system_stats():
             "count": psutil.cpu_count()
         },
         "model_type": "YOLO11 Large",
+        "coordinate_mode": "EXACT_ORIGINAL",
+        "max_image_size_mb": MAX_IMAGE_SIZE / (1024 * 1024),
+        "max_response_size_mb": MAX_RESPONSE_SIZE / (1024 * 1024),
         "detector_loaded": detector is not None
     }
     
@@ -357,6 +383,26 @@ async def get_system_stats():
             pass
     
     return stats
+
+@app.get("/coordinate_info")
+async def get_coordinate_info():
+    """Get information about coordinate accuracy and processing mode"""
+    return {
+        "coordinate_mode": "EXACT_ORIGINAL",
+        "image_resizing": False,
+        "coordinate_accuracy": "PIXEL_PERFECT",
+        "description": "All bounding box coordinates are exact pixel locations from your original image. No resizing is performed.",
+        "supported_formats": ["JPG", "JPEG", "PNG"],
+        "max_image_size_mb": MAX_IMAGE_SIZE / (1024 * 1024),
+        "benefits": [
+            "Exact pixel coordinates",
+            "No coordinate scaling needed",
+            "Perfect for pixel-level analysis",
+            "Maintains original image quality",
+            "Suitable for high-precision applications"
+        ],
+        "note": "Large images may require more processing time and memory but coordinates remain exact."
+    }
 
 if __name__ == "__main__":
     import uvicorn

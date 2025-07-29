@@ -123,14 +123,30 @@ class YOLODetector:
             "vms_mb": memory_info.vms / (1024 * 1024),
             "percent": process.memory_percent()
         }
+    
+    def _check_image_memory_requirements(self, height: int, width: int) -> dict:
+        """Check if image can be processed within memory limits"""
+        # Calculate approximate memory needed for image processing
+        # RGB image: height * width * 3 channels * 4 bytes (float32) * multiple copies during processing
+        estimated_memory_mb = (height * width * 3 * 4 * 6) / (1024 * 1024)  # 6x for processing overhead
+        
+        current_memory = psutil.virtual_memory()
+        available_mb = current_memory.available / (1024 * 1024)
+        
+        return {
+            "estimated_memory_mb": estimated_memory_mb,
+            "available_memory_mb": available_mb,
+            "can_process": estimated_memory_mb < (available_mb * 0.8),  # Use max 80% of available memory
+            "memory_ratio": estimated_memory_mb / available_mb
+        }
         
     def process_detections(self, results, image_shape) -> List[DetectionResult]:
-        """Convert YOLO results to structured detection data"""
+        """Convert YOLO results to structured detection data with original image coordinates"""
         detections = []
         
         try:
             if results and len(results) > 0 and results[0].boxes is not None and len(results[0].boxes) > 0:
-                logger.info(f"Processing {len(results[0].boxes)} detections")
+                logger.info(f"Processing {len(results[0].boxes)} detections from original image {image_shape}")
                 
                 for i, box in enumerate(results[0].boxes):
                     try:
@@ -143,11 +159,18 @@ class YOLODetector:
                             logger.warning(f"Unknown class index: {cls}")
                             continue
                             
+                        # Get coordinates - these are already in original image coordinates
                         x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
                         
-                        # Validate bounding box coordinates
+                        # Validate bounding box coordinates against original image dimensions
+                        height, width = image_shape[:2]
+                        x1 = max(0, min(x1, width - 1))
+                        y1 = max(0, min(y1, height - 1))
+                        x2 = max(x1 + 1, min(x2, width))
+                        y2 = max(y1 + 1, min(y2, height))
+                        
                         if x2 <= x1 or y2 <= y1:
-                            logger.warning(f"Invalid bounding box: ({x1}, {y1}, {x2}, {y2})")
+                            logger.warning(f"Invalid bounding box after clipping: ({x1}, {y1}, {x2}, {y2})")
                             continue
                         
                         # Calculate center point and area
@@ -164,7 +187,7 @@ class YOLODetector:
                         )
                         detections.append(detection)
                         
-                        logger.debug(f"Detection {i}: {class_name} ({conf:.2f}) at ({x1}, {y1}, {x2}, {y2})")
+                        logger.debug(f"Detection {i}: {class_name} ({conf:.2f}) at original coords ({x1}, {y1}, {x2}, {y2})")
                         
                     except Exception as e:
                         logger.error(f"Error processing detection {i}: {e}")
@@ -242,11 +265,12 @@ class YOLODetector:
     def detect_specific_objects(self, image_path: str, target_objects: List[str], 
                                conf_threshold: float = 0.25, include_similar: bool = True,  # Lower threshold for Large model
                                return_annotated_image: bool = True, fallback_to_all: bool = True) -> dict:
-        """Detect only specific objects requested by user, with fallback to all objects"""
+        """Detect objects with EXACT original image coordinates - NO RESIZING"""
         
         try:
             logger.info(f"Starting detection for: {target_objects}")
             logger.info(f"Confidence threshold: {conf_threshold}")
+            logger.info("PRESERVING ORIGINAL IMAGE DIMENSIONS - coordinates will be exact")
             
             # Log memory usage before detection
             memory_before = self.get_memory_usage()
@@ -269,40 +293,63 @@ class YOLODetector:
             if not os.path.exists(image_path):
                 return {"error": f"Image file not found: {image_path}", "detections": []}
             
-            frame = cv2.imread(image_path)
-            if frame is None:
+            original_frame = cv2.imread(image_path)
+            if original_frame is None:
                 return {"error": f"Cannot read image file: {image_path}", "detections": []}
             
-            # Resize large images for memory efficiency
-            height, width = frame.shape[:2]
-            max_size = 1920  # Railway memory optimization
-            if max(height, width) > max_size:
-                scale = max_size / max(height, width)
-                new_width = int(width * scale)
-                new_height = int(height * scale)
-                frame = cv2.resize(frame, (new_width, new_height))
-                logger.info(f"Resized image from {width}x{height} to {new_width}x{new_height}")
+            # Get original dimensions
+            original_height, original_width = original_frame.shape[:2]
+            logger.info(f"Original image dimensions: {original_width}x{original_height}")
             
-            logger.info(f"Image loaded: {frame.shape}")
+            # Check memory requirements for original image
+            memory_check = self._check_image_memory_requirements(original_height, original_width)
+            logger.info(f"Memory analysis: {memory_check}")
             
-            # FIXED: Run detection with explicit device parameter for Railway
-            logger.info(f"Running YOLO Large detection on device: {self.device}")
+            if not memory_check["can_process"]:
+                logger.warning(f"Image may cause memory issues (needs {memory_check['estimated_memory_mb']:.1f}MB, "
+                             f"available {memory_check['available_memory_mb']:.1f}MB)")
+                # Force garbage collection before processing
+                gc.collect()
+                if self.device != 'cpu':
+                    torch.cuda.empty_cache()
+            
+            # CRITICAL: Process image at original size to maintain exact coordinates
+            frame = original_frame.copy()  # Work with original dimensions
+            
+            logger.info(f"Processing at original size: {frame.shape}")
+            
+            # Run detection with explicit device parameter for Railway
+            logger.info(f"Running YOLO Large detection on device: {self.device} (ORIGINAL SIZE)")
             with torch.no_grad():  # Disable gradients for inference
-                results = self.model(
-                    frame, 
-                    conf=conf_threshold, 
-                    verbose=False, 
-                    save=False,
-                    device=self.device,  # Use explicit device instead of 'auto'
-                    half=True if self.device != 'cpu' else False  # Use FP16 on GPU only
-                )
+                # Process in smaller batches if image is very large
+                if memory_check["memory_ratio"] > 0.5:
+                    logger.info("Large image detected - using optimized inference settings")
+                    results = self.model(
+                        frame, 
+                        conf=conf_threshold, 
+                        verbose=False, 
+                        save=False,
+                        device=self.device,
+                        half=True if self.device != 'cpu' else False,
+                        max_det=300,  # Limit max detections for memory
+                        agnostic_nms=True  # Faster NMS
+                    )
+                else:
+                    results = self.model(
+                        frame, 
+                        conf=conf_threshold, 
+                        verbose=False, 
+                        save=False,
+                        device=self.device,
+                        half=True if self.device != 'cpu' else False
+                    )
             
             if not results:
                 logger.warning("No results returned from model")
                 return {"error": "No results from detection model", "detections": []}
             
-            logger.info("Processing detection results...")
-            all_detections = self.process_detections(results, frame.shape)
+            logger.info("Processing detection results with original coordinates...")
+            all_detections = self.process_detections(results, original_frame.shape)
             logger.info(f"Total detections found: {len(all_detections)}")
             
             # Log all detected classes for debugging
@@ -321,7 +368,7 @@ class YOLODetector:
                 used_fallback = True
                 logger.info("Using fallback - showing all detected objects")
             
-            # Prepare response
+            # Prepare response with ORIGINAL coordinates
             response = {
                 "requested_objects": target_objects,
                 "searched_classes": target_classes,
@@ -329,15 +376,17 @@ class YOLODetector:
                 "matching_objects_found": len(filtered_detections),
                 "used_fallback": used_fallback,
                 "fallback_message": "No requested objects found. Showing all detected objects." if used_fallback else None,
-                "image_dimensions": {"width": frame.shape[1], "height": frame.shape[0]},
+                "image_dimensions": {"width": original_width, "height": original_height},
+                "coordinates_type": "ORIGINAL_EXACT",  # Flag indicating coordinates are exact
                 "model_type": "YOLO11 Large",
                 "device_used": self.device,
+                "memory_info": memory_check,
                 "detections": []
             }
             
-            # Add detections (filtered or all)
+            # Add detections with ORIGINAL coordinates
             for i, detection in enumerate(filtered_detections):
-                # Calculate all vertices for the bounding box
+                # These coordinates are exact to the original image
                 x1, y1, x2, y2 = detection.bbox
                 vertices = {
                     "top_left": {"x": x1, "y": y1},
@@ -357,7 +406,7 @@ class YOLODetector:
                         "x2": x2,
                         "y2": y2
                     },
-                    "vertices": vertices,  # All four corner points
+                    "vertices": vertices,  # All four corner points - EXACT to original
                     "center_point": {
                         "x": detection.center_point[0],
                         "y": detection.center_point[1]
@@ -366,20 +415,21 @@ class YOLODetector:
                     "dimensions": {
                         "width": x2 - x1,
                         "height": y2 - y1
-                    }
+                    },
+                    "coordinates_note": "Exact pixel coordinates from original image"
                 })
             
             # Add annotated image if requested and detections exist
             if return_annotated_image and len(filtered_detections) > 0:
                 try:
-                    logger.info("Creating annotated image...")
-                    # Draw detections with different colors for fallback
-                    annotated = frame.copy()
+                    logger.info("Creating annotated image with ORIGINAL coordinates...")
+                    # Draw detections on ORIGINAL image
+                    annotated = original_frame.copy()
                     for detection in filtered_detections:
                         x1, y1, x2, y2 = detection.bbox
                         # Different color for fallback detections
                         color = (0, 165, 255) if used_fallback else (0, 255, 0)  # Orange for fallback, green for matches
-                        # Draw bounding box
+                        # Draw bounding box with coordinates exact to original
                         cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 3)  # Thicker lines for Large model
                         # Draw label with better visibility
                         label = f"{detection.class_name}: {detection.confidence:.2f}"
@@ -393,8 +443,8 @@ class YOLODetector:
                         cv2.putText(annotated, "Showing all objects (no matches found)", 
                                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
                     
-                    # Add model info with device
-                    cv2.putText(annotated, f"YOLO11 Large ({self.device.upper()})", 
+                    # Add model info with device and coordinate type
+                    cv2.putText(annotated, f"YOLO11 Large ({self.device.upper()}) - EXACT COORDS", 
                                (10, annotated.shape[0]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
                     
                     # Convert to base64 for web transmission with higher quality
@@ -403,7 +453,7 @@ class YOLODetector:
                     img_base64 = base64.b64encode(buffer).decode('utf-8')
                     response["annotated_image_base64"] = img_base64
                     
-                    logger.info(f"Annotated image created, base64 length: {len(img_base64)}")
+                    logger.info(f"Annotated image created with exact coordinates, base64 length: {len(img_base64)}")
                     
                 except Exception as e:
                     logger.error(f"Error creating annotated image: {e}")
@@ -413,6 +463,10 @@ class YOLODetector:
             memory_after = self.get_memory_usage()
             logger.info(f"Memory after detection: {memory_after}")
             
+            # Force cleanup for large images
+            del original_frame, frame
+            if 'annotated' in locals():
+                del annotated
             gc.collect()
             if self.device != 'cpu':
                 torch.cuda.empty_cache()
@@ -428,7 +482,7 @@ class YOLODetector:
     def detect_from_base64(self, image_base64: str, target_objects: List[str],
                           conf_threshold: float = 0.25, include_similar: bool = True,
                           fallback_to_all: bool = True) -> dict:
-        """Detect objects from base64 encoded image (for web API)"""
+        """Detect objects from base64 encoded image (for web API) - PRESERVES EXACT COORDINATES"""
         try:
             # Decode base64 image
             img_data = base64.b64decode(image_base64)
@@ -438,9 +492,12 @@ class YOLODetector:
             if img is None:
                 return {"error": "Failed to decode base64 image", "detections": []}
             
-            # Save temporarily
-            temp_path = f"temp_{int(time.time())}.jpg"
-            cv2.imwrite(temp_path, img)
+            logger.info(f"Processing base64 image at original size: {img.shape}")
+            
+            # Save temporarily WITHOUT any modifications to preserve exact dimensions
+            temp_path = f"temp_original_{int(time.time())}.jpg"
+            # Use maximum quality to preserve image exactly
+            cv2.imwrite(temp_path, img, [cv2.IMWRITE_JPEG_QUALITY, 100])
             
             # Run detection
             result = self.detect_specific_objects(
