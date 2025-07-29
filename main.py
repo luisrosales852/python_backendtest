@@ -40,7 +40,7 @@ else:
 
 MODEL_PATH = os.getenv("MODEL_PATH", "yolo11l.pt")  # Large model default
 HOST = os.getenv("HOST", "0.0.0.0")
-PORT = int(os.getenv("PORT", "8000"))
+PORT = int(os.getenv("PORT", "80"))
 
 # Railway-specific settings
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "1"))  # Single worker for memory efficiency
