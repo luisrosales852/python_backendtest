@@ -7,6 +7,7 @@ import tempfile
 import uuid
 from typing import Optional
 import logging
+import traceback
 
 from detector import YOLODetector
 
@@ -20,52 +21,70 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Get environment variables
-CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
+# Get environment variables with better defaults for production
+CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*")  # Allow all origins in production
+if CORS_ORIGINS != "*":
+    CORS_ORIGINS = CORS_ORIGINS.split(",")
+else:
+    CORS_ORIGINS = ["*"]
+
 MODEL_PATH = os.getenv("MODEL_PATH", "yolo11n.pt")
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8000"))
 
-# Enable CORS
+# Enable CORS with more permissive settings for production
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
 # Initialize detector (will be done on startup)
 detector = None
+detector_error = None
 
 @app.on_event("startup")
 async def startup_event():
     """Initialize the YOLO detector on startup"""
-    global detector
+    global detector, detector_error
     try:
         logger.info(f"Initializing YOLO detector with model: {MODEL_PATH}")
         detector = YOLODetector(model_path=MODEL_PATH)
         logger.info("YOLO detector initialized successfully")
+        
+        # Test the detector with a simple call
+        available_classes = detector.get_available_classes()
+        logger.info(f"Detector test successful. Available classes: {len(available_classes)}")
+        
     except Exception as e:
-        logger.error(f"Failed to initialize YOLO detector: {e}")
-        raise
+        error_msg = f"Failed to initialize YOLO detector: {e}"
+        logger.error(error_msg)
+        logger.error(traceback.format_exc())
+        detector_error = error_msg
+        # Don't raise - let the app start but return errors in endpoints
 
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
     return {
-        "status": "healthy",
+        "status": "healthy" if detector is not None else "detector_error",
         "detector_loaded": detector is not None,
+        "detector_error": detector_error,
         "message": "Object Detection API is running",
         "model_path": MODEL_PATH,
-        "cors_origins": CORS_ORIGINS
+        "cors_origins": CORS_ORIGINS,
+        "environment": os.getenv("RENDER", "local")
     }
 
 @app.get("/available_classes")
 async def get_available_classes():
     """Get available object classes and categories"""
     if detector is None:
-        raise HTTPException(status_code=500, detail="Detector not initialized")
+        error_msg = f"Detector not initialized. Error: {detector_error}"
+        logger.error(error_msg)
+        raise HTTPException(status_code=500, detail=error_msg)
     
     try:
         # Try to get classes with error handling
@@ -79,6 +98,7 @@ async def get_available_classes():
         }
     except Exception as e:
         logger.error(f"Error getting available classes: {e}")
+        logger.error(traceback.format_exc())
         
         # Fallback to hardcoded YOLO classes if model fails
         fallback_classes = [
@@ -127,7 +147,9 @@ async def detect_objects(
     - **fallback_to_all**: Show all detected objects if no matches found (default: True)
     """
     if detector is None:
-        raise HTTPException(status_code=500, detail="Detector not initialized")
+        error_msg = f"Detector not initialized. Error: {detector_error}"
+        logger.error(error_msg)
+        raise HTTPException(status_code=500, detail=error_msg)
     
     # Validate file type
     if not file.content_type or not file.content_type.startswith('image/'):
@@ -154,31 +176,63 @@ async def detect_objects(
         with open(temp_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
         
-        logger.info(f"Processing image: {file.filename}, objects: {target_objects}")
+        logger.info(f"Processing image: {file.filename}, objects: {target_objects}, confidence: {confidence}")
+        logger.info(f"Temp file saved: {temp_path}, size: {os.path.getsize(temp_path)} bytes")
         
-        # Run detection
-        result = detector.detect_specific_objects(
-            temp_path, 
-            target_objects, 
-            confidence, 
-            include_similar, 
-            return_annotated_image=True, 
-            fallback_to_all=fallback_to_all
-        )
+        # Run detection with error catching
+        try:
+            result = detector.detect_specific_objects(
+                temp_path, 
+                target_objects, 
+                confidence, 
+                include_similar, 
+                return_annotated_image=True, 
+                fallback_to_all=fallback_to_all
+            )
+        except Exception as detection_error:
+            logger.error(f"Detection processing error: {detection_error}")
+            logger.error(traceback.format_exc())
+            raise HTTPException(status_code=500, detail=f"Detection processing failed: {str(detection_error)}")
         
         # Check for errors in detection
         if "error" in result:
             logger.error(f"Detection error: {result['error']}")
             raise HTTPException(status_code=500, detail=f"Detection failed: {result['error']}")
         
-        logger.info(f"Detection completed: {result['matching_objects_found']} objects found")
+        # Log detailed results
+        logger.info(f"Detection completed successfully:")
+        logger.info(f"  - Total objects found: {result.get('total_objects_found', 0)}")
+        logger.info(f"  - Matching objects: {result.get('matching_objects_found', 0)}")
+        logger.info(f"  - Used fallback: {result.get('used_fallback', False)}")
+        logger.info(f"  - Image dimensions: {result.get('image_dimensions', {})}")
         
-        return JSONResponse(content=result)
+        # For large responses, optionally exclude the base64 image to reduce size
+        response_size_limit = int(os.getenv("MAX_RESPONSE_SIZE", "10485760"))  # 10MB default
+        
+        # Estimate response size (rough approximation)
+        if "annotated_image_base64" in result:
+            estimated_size = len(result["annotated_image_base64"]) * 0.75  # Base64 is ~33% larger than binary
+            logger.info(f"Estimated response size: {estimated_size} bytes")
+            
+            if estimated_size > response_size_limit:
+                logger.warning(f"Response too large ({estimated_size} bytes), removing annotated image")
+                result["annotated_image_base64"] = None
+                result["image_too_large"] = True
+        
+        return JSONResponse(
+            content=result,
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+                "Access-Control-Allow-Headers": "*",
+            }
+        )
         
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Unexpected error during detection: {e}")
+        logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
     finally:
         # Clean up temporary file
@@ -188,6 +242,18 @@ async def detect_objects(
                 logger.debug(f"Cleaned up temporary file: {temp_path}")
             except Exception as e:
                 logger.warning(f"Failed to clean up temporary file {temp_path}: {e}")
+
+# Add OPTIONS handler for CORS preflight
+@app.options("/detect")
+async def detect_options():
+    return JSONResponse(
+        content={},
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+        }
+    )
 
 if __name__ == "__main__":
     import uvicorn
