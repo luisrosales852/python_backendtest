@@ -62,13 +62,17 @@ class YOLODetector:
             memory = psutil.virtual_memory()
             logger.info(f"Available memory: {memory.available / (1024**3):.2f} GB")
             
-            # Configure PyTorch for Railway
-            if torch.cuda.is_available():
+            # FIXED: Properly detect and configure device for Railway
+            self.device = self._get_optimal_device()
+            logger.info(f"Using device: {self.device}")
+            
+            # Configure PyTorch for the detected device
+            if self.device != 'cpu':
                 logger.info(f"CUDA available: {torch.cuda.get_device_name()}")
                 torch.cuda.set_per_process_memory_fraction(0.8)  # Use 80% of GPU memory
             else:
-                logger.info("Using CPU inference")
-                torch.set_num_threads(4)  # Optimize CPU usage
+                logger.info("Using CPU inference - optimizing for Railway")
+                torch.set_num_threads(4)  # Optimize CPU usage for Railway
             
             # Load model with error handling
             self.model = YOLO(model_path)
@@ -82,7 +86,7 @@ class YOLODetector:
             
             # Memory cleanup after loading
             gc.collect()
-            if torch.cuda.is_available():
+            if self.device != 'cpu':
                 torch.cuda.empty_cache()
             
             self.cap = None
@@ -90,6 +94,25 @@ class YOLODetector:
         except Exception as e:
             logger.error(f"Failed to load YOLO model: {e}")
             raise RuntimeError(f"Cannot initialize YOLO detector: {e}")
+    
+    def _get_optimal_device(self):
+        """Determine the best device for Railway deployment"""
+        try:
+            # Check if CUDA is available and working
+            if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+                # Test if we can actually use CUDA
+                try:
+                    torch.cuda.current_device()
+                    return '0'  # Use first GPU
+                except Exception as e:
+                    logger.warning(f"CUDA available but not accessible: {e}")
+                    return 'cpu'
+            else:
+                logger.info("CUDA not available, using CPU")
+                return 'cpu'
+        except Exception as e:
+            logger.warning(f"Error detecting device: {e}, defaulting to CPU")
+            return 'cpu'
     
     def get_memory_usage(self):
         """Get current memory usage for monitoring"""
@@ -262,16 +285,16 @@ class YOLODetector:
             
             logger.info(f"Image loaded: {frame.shape}")
             
-            # Run detection with optimized settings for Large model
-            logger.info("Running YOLO Large detection...")
+            # FIXED: Run detection with explicit device parameter for Railway
+            logger.info(f"Running YOLO Large detection on device: {self.device}")
             with torch.no_grad():  # Disable gradients for inference
                 results = self.model(
                     frame, 
                     conf=conf_threshold, 
                     verbose=False, 
                     save=False,
-                    device='auto',  # Let YOLO choose best device
-                    half=True if torch.cuda.is_available() else False  # Use FP16 on GPU
+                    device=self.device,  # Use explicit device instead of 'auto'
+                    half=True if self.device != 'cpu' else False  # Use FP16 on GPU only
                 )
             
             if not results:
@@ -308,6 +331,7 @@ class YOLODetector:
                 "fallback_message": "No requested objects found. Showing all detected objects." if used_fallback else None,
                 "image_dimensions": {"width": frame.shape[1], "height": frame.shape[0]},
                 "model_type": "YOLO11 Large",
+                "device_used": self.device,
                 "detections": []
             }
             
@@ -369,8 +393,8 @@ class YOLODetector:
                         cv2.putText(annotated, "Showing all objects (no matches found)", 
                                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
                     
-                    # Add model info
-                    cv2.putText(annotated, "YOLO11 Large", 
+                    # Add model info with device
+                    cv2.putText(annotated, f"YOLO11 Large ({self.device.upper()})", 
                                (10, annotated.shape[0]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
                     
                     # Convert to base64 for web transmission with higher quality
@@ -390,7 +414,7 @@ class YOLODetector:
             logger.info(f"Memory after detection: {memory_after}")
             
             gc.collect()
-            if torch.cuda.is_available():
+            if self.device != 'cpu':
                 torch.cuda.empty_cache()
             
             return response
@@ -450,4 +474,4 @@ class YOLODetector:
         with open(json_path, 'w') as f:
             json.dump(export_data, f, indent=2)
         
-        return json_path 
+        return json_path
