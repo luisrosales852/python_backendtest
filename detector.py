@@ -43,9 +43,9 @@ class YOLODetector:
         "beverage": ["bottle", "wine glass", "cup"]
     }
     
-    def __init__(self, model_path='yolo11l.pt'):
+    def __init__(self, model_path='yolo11n.pt'):
         """Initialize YOLO11 Large detector"""
-        print("Loading YOLO11 Large model...")
+        print("Loading YOLO11 nano model...")
         self.model = YOLO(model_path)
         print("Model loaded!")
         self.cap = None
