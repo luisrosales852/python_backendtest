@@ -9,6 +9,8 @@ import time
 import base64
 import gc
 import logging
+import psutil
+import torch
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -48,12 +50,25 @@ class YOLODetector:
         "beverage": ["bottle", "wine glass", "cup"]
     }
     
-    def __init__(self, model_path='yolo11n.pt'):
+    def __init__(self, model_path='yolo11l.pt'):  # Changed to Large model
         try:
-            logger.info(f"Loading YOLO11 nano model from: {model_path}")
+            logger.info(f"Loading YOLO11 Large model from: {model_path}")
             
-            # Set environment variables for better compatibility
+            # Railway-specific optimizations
             os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
+            os.environ['OMP_NUM_THREADS'] = '4'  # Optimize for Railway's CPU
+            
+            # Check available memory before loading
+            memory = psutil.virtual_memory()
+            logger.info(f"Available memory: {memory.available / (1024**3):.2f} GB")
+            
+            # Configure PyTorch for Railway
+            if torch.cuda.is_available():
+                logger.info(f"CUDA available: {torch.cuda.get_device_name()}")
+                torch.cuda.set_per_process_memory_fraction(0.8)  # Use 80% of GPU memory
+            else:
+                logger.info("Using CPU inference")
+                torch.set_num_threads(4)  # Optimize CPU usage
             
             # Load model with error handling
             self.model = YOLO(model_path)
@@ -62,14 +77,29 @@ class YOLODetector:
             if not hasattr(self.model, 'names') or not self.model.names:
                 raise ValueError("Model loaded but class names are not accessible")
             
-            logger.info(f"Model loaded successfully! Available classes: {len(self.model.names)}")
+            logger.info(f"YOLO Large model loaded successfully! Available classes: {len(self.model.names)}")
             logger.info(f"Sample classes: {list(self.model.names.values())[:10]}")
+            
+            # Memory cleanup after loading
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             
             self.cap = None
             
         except Exception as e:
             logger.error(f"Failed to load YOLO model: {e}")
             raise RuntimeError(f"Cannot initialize YOLO detector: {e}")
+    
+    def get_memory_usage(self):
+        """Get current memory usage for monitoring"""
+        process = psutil.Process()
+        memory_info = process.memory_info()
+        return {
+            "rss_mb": memory_info.rss / (1024 * 1024),
+            "vms_mb": memory_info.vms / (1024 * 1024),
+            "percent": process.memory_percent()
+        }
         
     def process_detections(self, results, image_shape) -> List[DetectionResult]:
         """Convert YOLO results to structured detection data"""
@@ -187,13 +217,17 @@ class YOLODetector:
         return self.SIMILAR_OBJECTS
     
     def detect_specific_objects(self, image_path: str, target_objects: List[str], 
-                               conf_threshold: float = 0.3, include_similar: bool = True,
+                               conf_threshold: float = 0.25, include_similar: bool = True,  # Lower threshold for Large model
                                return_annotated_image: bool = True, fallback_to_all: bool = True) -> dict:
         """Detect only specific objects requested by user, with fallback to all objects"""
         
         try:
             logger.info(f"Starting detection for: {target_objects}")
             logger.info(f"Confidence threshold: {conf_threshold}")
+            
+            # Log memory usage before detection
+            memory_before = self.get_memory_usage()
+            logger.info(f"Memory before detection: {memory_before}")
             
             # Expand target objects if requested
             if include_similar:
@@ -216,11 +250,29 @@ class YOLODetector:
             if frame is None:
                 return {"error": f"Cannot read image file: {image_path}", "detections": []}
             
+            # Resize large images for memory efficiency
+            height, width = frame.shape[:2]
+            max_size = 1920  # Railway memory optimization
+            if max(height, width) > max_size:
+                scale = max_size / max(height, width)
+                new_width = int(width * scale)
+                new_height = int(height * scale)
+                frame = cv2.resize(frame, (new_width, new_height))
+                logger.info(f"Resized image from {width}x{height} to {new_width}x{new_height}")
+            
             logger.info(f"Image loaded: {frame.shape}")
             
-            # Run detection with explicit settings
-            logger.info("Running YOLO detection...")
-            results = self.model(frame, conf=conf_threshold, verbose=False, save=False)
+            # Run detection with optimized settings for Large model
+            logger.info("Running YOLO Large detection...")
+            with torch.no_grad():  # Disable gradients for inference
+                results = self.model(
+                    frame, 
+                    conf=conf_threshold, 
+                    verbose=False, 
+                    save=False,
+                    device='auto',  # Let YOLO choose best device
+                    half=True if torch.cuda.is_available() else False  # Use FP16 on GPU
+                )
             
             if not results:
                 logger.warning("No results returned from model")
@@ -255,6 +307,7 @@ class YOLODetector:
                 "used_fallback": used_fallback,
                 "fallback_message": "No requested objects found. Showing all detected objects." if used_fallback else None,
                 "image_dimensions": {"width": frame.shape[1], "height": frame.shape[0]},
+                "model_type": "YOLO11 Large",
                 "detections": []
             }
             
@@ -303,19 +356,25 @@ class YOLODetector:
                         # Different color for fallback detections
                         color = (0, 165, 255) if used_fallback else (0, 255, 0)  # Orange for fallback, green for matches
                         # Draw bounding box
-                        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-                        # Draw label
+                        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 3)  # Thicker lines for Large model
+                        # Draw label with better visibility
                         label = f"{detection.class_name}: {detection.confidence:.2f}"
-                        cv2.putText(annotated, label, (x1, y1-10), 
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                        label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+                        cv2.rectangle(annotated, (x1, y1-label_size[1]-10), (x1+label_size[0], y1), color, -1)
+                        cv2.putText(annotated, label, (x1, y1-5), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
                     
                     # Add fallback message on image if used
                     if used_fallback:
                         cv2.putText(annotated, "Showing all objects (no matches found)", 
-                                   (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+                                   (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
                     
-                    # Convert to base64 for web transmission
-                    encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 85]  # Reduce quality to save memory
+                    # Add model info
+                    cv2.putText(annotated, "YOLO11 Large", 
+                               (10, annotated.shape[0]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                    
+                    # Convert to base64 for web transmission with higher quality
+                    encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 90]  # Higher quality for Large model
                     _, buffer = cv2.imencode('.jpg', annotated, encode_param)
                     img_base64 = base64.b64encode(buffer).decode('utf-8')
                     response["annotated_image_base64"] = img_base64
@@ -326,8 +385,13 @@ class YOLODetector:
                     logger.error(f"Error creating annotated image: {e}")
                     response["annotation_error"] = str(e)
             
-            # Clean up memory
+            # Memory cleanup and logging
+            memory_after = self.get_memory_usage()
+            logger.info(f"Memory after detection: {memory_after}")
+            
             gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             
             return response
             
@@ -338,7 +402,7 @@ class YOLODetector:
             return {"error": str(e), "detections": []}
     
     def detect_from_base64(self, image_base64: str, target_objects: List[str],
-                          conf_threshold: float = 0.3, include_similar: bool = True,
+                          conf_threshold: float = 0.25, include_similar: bool = True,
                           fallback_to_all: bool = True) -> dict:
         """Detect objects from base64 encoded image (for web API)"""
         try:

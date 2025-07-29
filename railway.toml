@@ -1,0 +1,10 @@
+[build]
+builder = "NIXPACKS"
+
+[deploy]
+startCommand = "python main.md"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 3
+
+[settings]
+generateDomain = true

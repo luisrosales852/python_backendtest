@@ -1,0 +1,14 @@
+[phases.setup]
+nixPkgs = ["python310", "gcc", "pkg-config"]
+
+[phases.install]
+cmds = [
+    "pip install -r requierements.md",
+    "pip install gunicorn"
+]
+
+[phases.build]
+cmds = ["echo 'Build complete'"]
+
+[start]
+cmd = "gunicorn main:app -w 1 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:$PORT --timeout 300 --keep-alive 5 --max-requests 1000"

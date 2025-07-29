@@ -8,31 +8,46 @@ import uuid
 from typing import Optional
 import logging
 import traceback
+import psutil
+import signal
+import sys
 
 from detector import YOLODetector
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+# Configure logging for Railway
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('/tmp/app.log', mode='a')
+    ]
+)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="Object Detection API",
-    description="YOLO-based object detection service",
-    version="1.0.0"
+    title="Object Detection API - YOLO Large",
+    description="Advanced YOLO11 Large model object detection service on Railway",
+    version="2.0.0"
 )
 
-# Get environment variables with better defaults for production
-CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*")  # Allow all origins in production
+# Railway-optimized environment variables
+CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*")  # Railway allows flexible CORS
 if CORS_ORIGINS != "*":
     CORS_ORIGINS = CORS_ORIGINS.split(",")
 else:
     CORS_ORIGINS = ["*"]
 
-MODEL_PATH = os.getenv("MODEL_PATH", "yolo11n.pt")
+MODEL_PATH = os.getenv("MODEL_PATH", "yolo11l.pt")  # Large model default
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8000"))
 
-# Enable CORS with more permissive settings for production
+# Railway-specific settings
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "1"))  # Single worker for memory efficiency
+RAILWAY_ENVIRONMENT = os.getenv("RAILWAY_ENVIRONMENT", "unknown")
+MAX_IMAGE_SIZE = int(os.getenv("MAX_IMAGE_SIZE", "20971520"))  # 20MB for Large model
+
+# Enable CORS for Railway deployment
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -45,21 +60,51 @@ app.add_middleware(
 detector = None
 detector_error = None
 
+def graceful_shutdown(signum, frame):
+    """Graceful shutdown handler for Railway"""
+    logger.info("Received shutdown signal, cleaning up...")
+    global detector
+    if detector:
+        # Clean up any resources
+        pass
+    sys.exit(0)
+
+# Register signal handlers for Railway
+signal.signal(signal.SIGTERM, graceful_shutdown)
+signal.signal(signal.SIGINT, graceful_shutdown)
+
 @app.on_event("startup")
 async def startup_event():
-    """Initialize the YOLO detector on startup"""
+    """Initialize the YOLO Large detector on startup"""
     global detector, detector_error
     try:
-        logger.info(f"Initializing YOLO detector with model: {MODEL_PATH}")
+        logger.info("=" * 60)
+        logger.info("Starting Object Detection API with YOLO Large")
+        logger.info(f"Railway Environment: {RAILWAY_ENVIRONMENT}")
+        logger.info("=" * 60)
+        
+        # Check system resources
+        memory = psutil.virtual_memory()
+        cpu_count = psutil.cpu_count()
+        logger.info(f"System Info:")
+        logger.info(f"  - Total Memory: {memory.total / (1024**3):.2f} GB")
+        logger.info(f"  - Available Memory: {memory.available / (1024**3):.2f} GB")
+        logger.info(f"  - CPU Cores: {cpu_count}")
+        
+        logger.info(f"Initializing YOLO Large detector with model: {MODEL_PATH}")
         detector = YOLODetector(model_path=MODEL_PATH)
-        logger.info("YOLO detector initialized successfully")
+        logger.info("YOLO Large detector initialized successfully")
         
         # Test the detector with a simple call
         available_classes = detector.get_available_classes()
         logger.info(f"Detector test successful. Available classes: {len(available_classes)}")
         
+        # Log memory usage after initialization
+        memory_after = psutil.virtual_memory()
+        logger.info(f"Memory after initialization: {memory_after.available / (1024**3):.2f} GB available")
+        
     except Exception as e:
-        error_msg = f"Failed to initialize YOLO detector: {e}"
+        error_msg = f"Failed to initialize YOLO Large detector: {e}"
         logger.error(error_msg)
         logger.error(traceback.format_exc())
         detector_error = error_msg
@@ -67,15 +112,26 @@ async def startup_event():
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
+    """Health check endpoint with system information"""
+    memory = psutil.virtual_memory()
+    cpu_percent = psutil.cpu_percent(interval=1)
+    
     return {
         "status": "healthy" if detector is not None else "detector_error",
         "detector_loaded": detector is not None,
         "detector_error": detector_error,
-        "message": "Object Detection API is running",
+        "message": "Object Detection API with YOLO Large is running",
         "model_path": MODEL_PATH,
+        "model_type": "YOLO11 Large",
         "cors_origins": CORS_ORIGINS,
-        "environment": os.getenv("RENDER", "local")
+        "environment": RAILWAY_ENVIRONMENT,
+        "system": {
+            "memory_total_gb": round(memory.total / (1024**3), 2),
+            "memory_available_gb": round(memory.available / (1024**3), 2),
+            "memory_used_percent": memory.percent,
+            "cpu_percent": cpu_percent,
+            "cpu_count": psutil.cpu_count()
+        }
     }
 
 @app.get("/available_classes")
@@ -94,7 +150,8 @@ async def get_available_classes():
         return {
             "classes": classes,
             "categories": categories,
-            "total_classes": len(classes)
+            "total_classes": len(classes),
+            "model_type": "YOLO11 Large"
         }
     except Exception as e:
         logger.error(f"Error getting available classes: {e}")
@@ -126,6 +183,7 @@ async def get_available_classes():
             "categories": fallback_categories,
             "total_classes": len(fallback_classes),
             "fallback_used": True,
+            "model_type": "YOLO11 Large (Fallback)",
             "error": str(e)
         }
 
@@ -134,16 +192,16 @@ async def detect_objects(
     file: UploadFile = File(...),
     objects: str = Form(...),  # Comma-separated list
     include_similar: bool = Form(True),
-    confidence: float = Form(0.3),
+    confidence: float = Form(0.25),  # Lower default for Large model
     fallback_to_all: bool = Form(True)
 ):
     """
-    Detect objects in uploaded image
+    Detect objects in uploaded image using YOLO Large
     
-    - **file**: Image file to analyze
+    - **file**: Image file to analyze (max 20MB for Large model)
     - **objects**: Comma-separated list of objects to detect
     - **include_similar**: Whether to include similar objects (default: True)
-    - **confidence**: Confidence threshold 0-1 (default: 0.3)
+    - **confidence**: Confidence threshold 0-1 (default: 0.25 for Large model)
     - **fallback_to_all**: Show all detected objects if no matches found (default: True)
     """
     if detector is None:
@@ -154,6 +212,11 @@ async def detect_objects(
     # Validate file type
     if not file.content_type or not file.content_type.startswith('image/'):
         raise HTTPException(status_code=400, detail="File must be an image")
+    
+    # Check file size (larger limit for Large model)
+    if file.size and file.size > MAX_IMAGE_SIZE:
+        size_mb = MAX_IMAGE_SIZE / (1024 * 1024)
+        raise HTTPException(status_code=400, detail=f"File size must be less than {size_mb}MB")
     
     # Validate confidence range
     if not 0.0 <= confidence <= 1.0:
@@ -166,8 +229,12 @@ async def detect_objects(
     
     temp_path = None
     try:
+        # Log memory before processing
+        memory_before = psutil.virtual_memory()
+        logger.info(f"Memory before processing: {memory_before.available / (1024**3):.2f} GB available")
+        
         # Create temporary file with unique name
-        temp_dir = os.getenv("TEMP_DIR", tempfile.gettempdir())
+        temp_dir = os.getenv("TEMP_DIR", "/tmp")  # Railway uses /tmp
         os.makedirs(temp_dir, exist_ok=True)
         temp_filename = f"detect_{uuid.uuid4().hex}_{file.filename}"
         temp_path = os.path.join(temp_dir, temp_filename)
@@ -205,19 +272,25 @@ async def detect_objects(
         logger.info(f"  - Matching objects: {result.get('matching_objects_found', 0)}")
         logger.info(f"  - Used fallback: {result.get('used_fallback', False)}")
         logger.info(f"  - Image dimensions: {result.get('image_dimensions', {})}")
+        logger.info(f"  - Model type: {result.get('model_type', 'Unknown')}")
         
-        # For large responses, optionally exclude the base64 image to reduce size
-        response_size_limit = int(os.getenv("MAX_RESPONSE_SIZE", "10485760"))  # 10MB default
+        # Railway-optimized response size management
+        response_size_limit = int(os.getenv("MAX_RESPONSE_SIZE", "52428800"))  # 50MB default for Railway
         
         # Estimate response size (rough approximation)
         if "annotated_image_base64" in result:
             estimated_size = len(result["annotated_image_base64"]) * 0.75  # Base64 is ~33% larger than binary
-            logger.info(f"Estimated response size: {estimated_size} bytes")
+            logger.info(f"Estimated response size: {estimated_size / (1024*1024):.2f} MB")
             
             if estimated_size > response_size_limit:
-                logger.warning(f"Response too large ({estimated_size} bytes), removing annotated image")
+                logger.warning(f"Response too large ({estimated_size / (1024*1024):.2f} MB), removing annotated image")
                 result["annotated_image_base64"] = None
                 result["image_too_large"] = True
+                result["message"] = "Image annotations removed due to size. Detection results preserved."
+        
+        # Log memory after processing
+        memory_after = psutil.virtual_memory()
+        logger.info(f"Memory after processing: {memory_after.available / (1024**3):.2f} GB available")
         
         return JSONResponse(
             content=result,
@@ -255,6 +328,43 @@ async def detect_options():
         }
     )
 
+@app.get("/stats")
+async def get_system_stats():
+    """Get current system statistics - useful for Railway monitoring"""
+    memory = psutil.virtual_memory()
+    cpu_percent = psutil.cpu_percent(interval=1)
+    
+    stats = {
+        "memory": {
+            "total_gb": round(memory.total / (1024**3), 2),
+            "available_gb": round(memory.available / (1024**3), 2),
+            "used_gb": round(memory.used / (1024**3), 2),
+            "percent": memory.percent
+        },
+        "cpu": {
+            "percent": cpu_percent,
+            "count": psutil.cpu_count()
+        },
+        "model_type": "YOLO11 Large",
+        "detector_loaded": detector is not None
+    }
+    
+    if detector:
+        try:
+            detector_memory = detector.get_memory_usage()
+            stats["detector_memory"] = detector_memory
+        except:
+            pass
+    
+    return stats
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host=HOST, port=PORT) 
+    uvicorn.run(
+        app, 
+        host=HOST, 
+        port=PORT,
+        workers=MAX_WORKERS,
+        access_log=True,
+        log_level="info"
+    ) 
