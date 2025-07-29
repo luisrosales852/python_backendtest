@@ -1,5 +1,5 @@
 [phases.setup]
-nixPkgs = ["...", "libGL", "glib", "xorg.libSM", "xorg.libXext", "xorg.libXrender", "gcc"]
+nixPkgs = ["...", "libGL", "glib"]
 
 [phases.install]
 cmds = ["pip install -r requirements.txt"]
