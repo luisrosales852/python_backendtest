@@ -1,14 +1,18 @@
+[variables]
+NIXPACKS_PYTHON_VERSION = "3.10"
+
 [phases.setup]
-nixPkgs = ["python310", "gcc", "pkg-config"]
+nixPkgs = ["python310", "python310Packages.pip", "gcc", "pkg-config", "libGL", "glib"]
 
 [phases.install]
 cmds = [
-    "pip install -r requierements.md",
-    "pip install gunicorn"
+    "python3.10 -m pip install --upgrade pip setuptools wheel",
+    "python3.10 -m pip install -r requierements.md",
+    "python3.10 -m pip install gunicorn"
 ]
 
 [phases.build]
 cmds = ["echo 'Build complete'"]
 
 [start]
-cmd = "gunicorn main:app -w 1 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:$PORT --timeout 300 --keep-alive 5 --max-requests 1000"
+cmd = "python3.10 -m gunicorn main:app -w 1 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:$PORT --timeout 300 --keep-alive 5 --max-requests 1000"
